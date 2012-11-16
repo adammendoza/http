@@ -49,11 +49,11 @@ static HttpConn *openConnection(HttpConn *conn, struct MprSsl *ssl)
         return conn;
     }
     if ((sp = mprCreateSocket()) == 0) {
-        httpError(conn, HTTP_CODE_COMMS_ERROR, "Can't create socket for %s", uri->uri);
+        httpError(conn, HTTP_CODE_COMMS_ERROR, "Cannot create socket for %s", uri->uri);
         return 0;
     }
     if ((rc = mprConnectSocket(sp, ip, port, 0)) < 0) {
-        httpError(conn, HTTP_CODE_COMMS_ERROR, "Can't open socket on %s:%d", ip, port);
+        httpError(conn, HTTP_CODE_COMMS_ERROR, "Cannot open socket on %s:%d", ip, port);
         return 0;
     }
     conn->sock = sp;
@@ -89,16 +89,19 @@ static HttpConn *openConnection(HttpConn *conn, struct MprSsl *ssl)
 
 static void setDefaultHeaders(HttpConn *conn)
 {
-    HttpAuthType    *authType;
+    HttpAuthType    *ap;
 
     assure(conn);
 
     if (smatch(conn->protocol, "HTTP/1.0")) {
         conn->http10 = 1;
     }
-    if (conn->authType && (authType = httpLookupAuthType(conn->authType)) != 0) {
-        (authType->setAuth)(conn);
-        conn->setCredentials = 1;
+    if (conn->username && conn->authType) {
+        if ((ap = httpLookupAuthType(conn->authType)) != 0) {
+            if ((ap->setAuth)(conn)) {
+                conn->authRequested = 1;
+            }
+        }
     }
     if (conn->port != 80) {
         httpAddHeader(conn, "Host", "%s:%d", conn->ip, conn->port);
@@ -120,7 +123,7 @@ PUBLIC int httpConnect(HttpConn *conn, cchar *method, cchar *uri, struct MprSsl 
     assure(uri && *uri);
 
     if (conn->endpoint) {
-        httpError(conn, HTTP_CODE_BAD_GATEWAY, "Can't call connect in a server");
+        httpError(conn, HTTP_CODE_BAD_GATEWAY, "Cannot call connect in a server");
         return MPR_ERR_BAD_STATE;
     }
     mprLog(4, "Http: client request: %s %s", method, uri);
@@ -131,7 +134,7 @@ PUBLIC int httpConnect(HttpConn *conn, cchar *method, cchar *uri, struct MprSsl 
     }
     assure(conn->state == HTTP_STATE_BEGIN);
     httpSetState(conn, HTTP_STATE_CONNECTED);
-    conn->setCredentials = 0;
+    conn->authRequested = 0;
     conn->tx->method = supper(method);
     conn->tx->parsedUri = httpCreateUri(uri, 0);
 #if BIT_DEBUG
@@ -170,9 +173,9 @@ PUBLIC bool httpNeedRetry(HttpConn *conn, char **url)
         return 0;
     }
     if (rx->status == HTTP_CODE_UNAUTHORIZED) {
-        if (conn->username == 0) {
+        if (conn->username == 0 || conn->authType == 0) {
             httpFormatError(conn, rx->status, "Authentication required");
-        } else if (conn->setCredentials) {
+        } else if (conn->authRequested) {
             httpFormatError(conn, rx->status, "Authentication failed");
         } else {
             if (conn->authType && (authType = httpLookupAuthType(conn->authType)) != 0) {
@@ -211,7 +214,7 @@ static int blockingFileCopy(HttpConn *conn, cchar *path)
 
     file = mprOpenFile(path, O_RDONLY | O_BINARY, 0);
     if (file == 0) {
-        mprError("Can't open %s", path);
+        mprError("Cannot open %s", path);
         return MPR_ERR_CANT_OPEN;
     }
     mprAddRoot(file);
@@ -257,7 +260,7 @@ PUBLIC ssize httpWriteUploadData(HttpConn *conn, MprList *fileData, MprList *for
     if (fileData) {
         for (rc = next = 0; rc >= 0 && (path = mprGetNextItem(fileData, &next)) != 0; ) {
             if (!mprPathExists(path, R_OK)) {
-                httpFormatError(conn, 0, "Can't open %s", path);
+                httpFormatError(conn, 0, "Cannot open %s", path);
                 return MPR_ERR_CANT_OPEN;
             }
             name = mprGetPathBase(path);

@@ -101,40 +101,34 @@ static void netOutgoingService(HttpQueue *q)
          */
         assure(q->ioIndex > 0);
         written = mprWriteSocketVector(conn->sock, q->iovec, q->ioIndex);
-        LOG(5, "Net connector wrote %d, written so far %Ld, q->count %d/%d", written, tx->bytesWritten, q->count, q->max);
         if (written < 0) {
             errCode = mprGetError(q);
+            LOG(6, "netConnector: wrote %d, errno %d, qflags %x", (int) written, errCode, q->flags);
             if (errCode == EAGAIN || errCode == EWOULDBLOCK) {
                 /*  Socket full, wait for an I/O event */
                 httpSocketBlocked(conn);
                 break;
             }
-            if (errCode != EPIPE && errCode != ECONNRESET) {
-                LOG(5, "netOutgoingService write failed, error %d", errCode);
+            if (errCode != EPIPE && errCode != ECONNRESET && errCode != ENOTCONN) {
+                httpError(conn, HTTP_ABORT | HTTP_CODE_COMMS_ERROR, "netConnector: Write response error %d", errCode);
+            } else {
+                httpDisconnect(conn);
             }
-            httpError(conn, HTTP_ABORT | HTTP_CODE_COMMS_ERROR, "Write error %d", errCode);
             httpFinalizeConnector(conn);
             break;
 
-        } else if (written == 0) {
-            /*  Socket full, wait for an I/O event */
-            httpSocketBlocked(conn);
-            break;
-
         } else if (written > 0) {
+            LOG(6, "netConnector: wrote %d, ask %d, qflags %x", (int) written, q->ioCount, q->flags);
             tx->bytesWritten += written;
             freeNetPackets(q, written);
             adjustNetVec(q, written);
         }
     }
-    if (q->ioCount == 0) {
-        if ((q->flags & HTTP_QUEUE_EOF)) {
-            assure(conn->writeq->count == 0);
-            assure(conn->tx->finalizedOutput);
-            httpFinalizeConnector(conn);
-        } else {
-            HTTP_NOTIFY(conn, HTTP_EVENT_WRITABLE, 0);
-        }
+    if (q->first && q->first->flags & HTTP_PACKET_END) {
+        LOG(6, "netConnector: end of stream. Finalize connector");
+        httpFinalizeConnector(conn);
+    } else {
+        HTTP_NOTIFY(conn, HTTP_EVENT_WRITABLE, 0);
     }
 }
 
@@ -146,7 +140,7 @@ static MprOff buildNetVec(HttpQueue *q)
 {
     HttpConn    *conn;
     HttpTx      *tx;
-    HttpPacket  *packet;
+    HttpPacket  *packet, *prev;
 
     conn = q->conn;
     tx = conn->tx;
@@ -155,25 +149,25 @@ static MprOff buildNetVec(HttpQueue *q)
         Examine each packet and accumulate as many packets into the I/O vector as possible. Leave the packets on the queue 
         for now, they are removed after the IO is complete for the entire packet.
      */
-    for (packet = q->first; packet; packet = packet->next) {
+    for (packet = prev = q->first; packet && !(packet->flags & HTTP_PACKET_END); packet = packet->next) {
         if (packet->flags & HTTP_PACKET_HEADER) {
             if (tx->chunkSize <= 0 && q->count > 0 && tx->length < 0) {
                 /* Incase no chunking filter and we've not seen all the data yet */
                 conn->keepAliveCount = 0;
             }
             httpWriteHeaders(q, packet);
-
-        } else if (packet->flags & HTTP_PACKET_END) {
-            assure(conn->tx->finalizedOutput);
-            q->flags |= HTTP_QUEUE_EOF;
-            if (packet->prefix == NULL) {
-                break;
-            }
         }
         if (q->ioIndex >= (HTTP_MAX_IOVEC - 2)) {
             break;
         }
-        addPacketForNet(q, packet);
+        if (httpGetPacketLength(packet) > 0 || packet->prefix) {
+            addPacketForNet(q, packet);
+        } else {
+            /* Remove empty packets */
+            prev->next = packet->next;
+            continue;
+        }
+        prev = packet;
     }
     return q->ioCount;
 }
@@ -223,13 +217,19 @@ static void addPacketForNet(HttpQueue *q, HttpPacket *packet)
 
 static void freeNetPackets(HttpQueue *q, ssize bytes)
 {
-    HttpPacket    *packet;
-    ssize         len;
+    HttpPacket  *packet;
+    ssize       len;
 
     assure(q->count >= 0);
-    assure(bytes >= 0);
+    assure(bytes > 0);
 
-    while (bytes > 0 && (packet = q->first) != 0) {
+    /*
+        Loop while data to be accounted for and we have not hit the end of data packet.
+        Chunks will have the chunk header in the packet->prefix.
+        The final chunk trailer will be in a packet->prefix with no other data content.
+        Must leave this routine with the end packet still on the queue and all bytes accounted for.
+     */
+    while ((packet = q->first) != 0 && !(packet->flags & HTTP_PACKET_END) && bytes > 0) {
         if (packet->prefix) {
             len = mprGetBufLength(packet->prefix);
             len = min(len, bytes);
@@ -248,13 +248,15 @@ static void freeNetPackets(HttpQueue *q, ssize bytes)
             q->count -= len;
             assure(q->count >= 0);
         }
-        if (packet->content == 0 || mprGetBufLength(packet->content) == 0) {
-            /*
-                This will remove the packet from the queue and will re-enable upstream disabled queues.
-             */
+        if (httpGetPacketLength(packet) == 0) {
+            /* Done with this packet - consume it */
+            assure(!(packet->flags & HTTP_PACKET_END));
             httpGetPacket(q);
+        } else {
+            break;
         }
     }
+    assure(bytes == 0);
 }
 
 

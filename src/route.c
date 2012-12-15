@@ -67,11 +67,12 @@ PUBLIC HttpRoute *httpCreateRoute(HttpHost *host)
     route->auth = httpCreateAuth();
     route->defaultLanguage = sclone("en");
     route->dir = mprGetCurrentPath(".");
+    route->home = route->dir;
     route->errorDocuments = mprCreateHash(HTTP_SMALL_HASH_SIZE, 0);
     route->extensions = mprCreateHash(HTTP_SMALL_HASH_SIZE, MPR_HASH_CASELESS);
     route->flags = HTTP_ROUTE_GZIP;
-    route->handlers = mprCreateList(-1, 0);
-    route->handlersWithMatch = mprCreateList(-1, 0);
+    route->handlers = mprCreateList(-1, MPR_LIST_STABLE);
+    route->handlersWithMatch = mprCreateList(-1, MPR_LIST_STABLE);
     route->host = host;
     route->http = MPR->httpService;
     route->indicies = mprCreateList(-1, 0);
@@ -121,6 +122,7 @@ PUBLIC HttpRoute *httpCreateInheritedRoute(HttpRoute *parent)
     route->connector = parent->connector;
     route->defaultLanguage = parent->defaultLanguage;
     route->dir = parent->dir;
+    route->home = parent->home;
     route->data = parent->data;
     route->eroute = parent->eroute;
     route->errorDocuments = parent->errorDocuments;
@@ -186,6 +188,7 @@ static void manageRoute(HttpRoute *route, int flags)
         mprMark(route->targetRule);
         mprMark(route->target);
         mprMark(route->dir);
+        mprMark(route->home);
         mprMark(route->indicies);
         mprMark(route->methodSpec);
         mprMark(route->handler);
@@ -360,16 +363,10 @@ PUBLIC void httpRouteRequest(HttpConn *conn)
     route = 0;
 
     for (next = rewrites = 0; rewrites < HTTP_MAX_REWRITE; ) {
-#if !BIT_LOCK_FIX
-        if ((route = mprGetNextItem(conn->host->routes, &next)) == 0) {
-            break;
-        }
-#else
         if (next >= conn->host->routes->length) {
             break;
         }
         route = conn->host->routes->items[next++];
-#endif
         if (route->startSegment && strncmp(rx->pathInfo, route->startSegment, route->startSegmentLen) != 0) {
             /* Failed to match the first URI segment, skip to the next group */
             assure(next <= route->nextGroup);
@@ -604,7 +601,7 @@ static int selectHandler(HttpConn *conn, HttpRoute *route)
     /*
         Handlers with match routines are examined first (in-order)
      */
-    for (next = 0; (tx->handler = mprGetNextItem(route->handlersWithMatch, &next)) != 0; ) {
+    for (next = 0; (tx->handler = mprGetNextStableItem(route->handlersWithMatch, &next)) != 0; ) {
         rc = tx->handler->match(conn, route, 0);
         if (rc == HTTP_ROUTE_OK || rc == HTTP_ROUTE_REROUTE) {
             return rc;
@@ -1090,7 +1087,20 @@ PUBLIC void httpSetRouteDir(HttpRoute *route, cchar *path)
     assure(path && *path);
     
     route->dir = httpMakePath(route, path);
+    httpSetRouteVar(route, "DOCUMENTS", route->dir);
+
+    //  DEPRECATE
     httpSetRouteVar(route, "DOCUMENT_ROOT", route->dir);
+}
+
+
+PUBLIC void httpSetRouteHome(HttpRoute *route, cchar *path)
+{
+    assure(route);
+    assure(path && *path);
+    
+    route->home = httpMakePath(route, path);
+    httpSetRouteVar(route, "ROUTE_HOME", route->home);
 }
 
 
@@ -1198,7 +1208,7 @@ PUBLIC void httpSetRouteScript(HttpRoute *route, cchar *script, cchar *scriptPat
 
         Target close
         Target redirect status [URI]
-        Target run ${DOCUMENT_ROOT}/${request:uri}.gz
+        Target run ${DOCUMENTS}/${request:uri}.gz
         Target run ${controller}-${name} 
         Target write [-r] status "Hello World\r\n"
  */
@@ -1790,7 +1800,7 @@ PUBLIC void httpSetRouteVar(HttpRoute *route, cchar *key, cchar *value)
 
 /*
     Make a path name. This replaces $references, converts to an absolute path name, cleans the path and maps delimiters.
-    Paths are resolved relative to host->home (ServerRoot).
+    Paths are resolved relative to the route home.
  */
 PUBLIC char *httpMakePath(HttpRoute *route, cchar *file)
 {
@@ -1803,7 +1813,7 @@ PUBLIC char *httpMakePath(HttpRoute *route, cchar *file)
         return 0;
     }
     if (mprIsPathRel(path) && route->host) {
-        path = mprJoinPath(route->host->home, path);
+        path = mprJoinPath(route->home, path);
     }
     return mprGetAbsPath(path);
 }
@@ -2465,10 +2475,14 @@ static void definePathVars(HttpRoute *route)
 static void defineHostVars(HttpRoute *route) 
 {
     assure(route);
-    mprAddKey(route->vars, "DOCUMENT_ROOT", route->dir);
-    mprAddKey(route->vars, "SERVER_ROOT", route->host->home);
+    mprAddKey(route->vars, "DOCUMENTS", route->dir);
+    mprAddKey(route->vars, "ROUTE_HOME", route->home);
     mprAddKey(route->vars, "SERVER_NAME", route->host->name);
     mprAddKey(route->vars, "SERVER_PORT", itos(route->host->port));
+
+    //  DEPRECATE
+    mprAddKey(route->vars, "DOCUMENT_ROOT", route->dir);
+    mprAddKey(route->vars, "SERVER_ROOT", route->home);
 }
 
 
@@ -2736,7 +2750,7 @@ PUBLIC void httpDefineRouteBuiltins()
         %N - Number. Parses numbers in base 10.
         %S - String. Removes quotes.
         %T - Template String. Removes quotes and expand ${PathVars}.
-        %P - Path string. Removes quotes and expands ${PathVars}. Resolved relative to host->dir (ServerRoot).
+        %P - Path string. Removes quotes and expands ${PathVars}. Resolved relative to host->dir (Home).
         %W - Parse words into a list
         %! - Optional negate. Set value to HTTP_ROUTE_NOT present, otherwise zero.
     Values wrapped in quotes will have the outermost quotes trimmed.

@@ -211,14 +211,12 @@ PUBLIC void httpStopEndpoint(HttpEndpoint *endpoint)
  */
 PUBLIC bool httpValidateLimits(HttpEndpoint *endpoint, int event, HttpConn *conn)
 {
-    HttpLimits      *limits;
-    Http            *http;
-    cchar           *action;
-    int             count, level, dir;
+    HttpLimits  *limits;
+    Http        *http;
+    int         count, level, dir;
 
     limits = conn->limits;
     dir = HTTP_TRACE_RX;
-    action = "unknown";
     assure(conn->endpoint == endpoint);
     http = endpoint->http;
 
@@ -229,17 +227,24 @@ PUBLIC bool httpValidateLimits(HttpEndpoint *endpoint, int event, HttpConn *conn
         /*
             This measures active client systems with unique IP addresses.
          */
-        if (endpoint->clientCount >= limits->clientMax) {
+        if (endpoint->activeClients >= limits->clientMax) {
             unlock(endpoint);
             /*  Abort connection */
             httpError(conn, HTTP_ABORT | HTTP_CODE_SERVICE_UNAVAILABLE, 
-                "Too many concurrent clients %d/%d", endpoint->clientCount, limits->clientMax);
+                "Too many concurrent clients %d/%d", endpoint->activeClients, limits->clientMax);
             return 0;
         }
         count = (int) PTOL(mprLookupKey(endpoint->clientLoad, conn->ip));
+        mprLog(7, "Connection count for client %s, count %d limit %d\n", conn->ip, count, limits->requestsPerClientMax);
+        if (count >= limits->requestsPerClientMax) {
+            unlock(endpoint);
+            /*  Abort connection */
+            httpError(conn, HTTP_ABORT | HTTP_CODE_SERVICE_UNAVAILABLE, 
+                "Too many concurrent requests for this client %s %d/%d", conn->ip, count, limits->requestsPerClientMax);
+            return 0;
+        }
         mprAddKey(endpoint->clientLoad, conn->ip, ITOP(count + 1));
-        endpoint->clientCount = (int) mprGetHashLength(endpoint->clientLoad);
-        action = "open conn";
+        endpoint->activeClients = (int) mprGetHashLength(endpoint->clientLoad);
         dir = HTTP_TRACE_RX;
         break;
 
@@ -250,64 +255,60 @@ PUBLIC bool httpValidateLimits(HttpEndpoint *endpoint, int event, HttpConn *conn
         } else {
             mprRemoveKey(endpoint->clientLoad, conn->ip);
         }
-        endpoint->clientCount = (int) mprGetHashLength(endpoint->clientLoad);
-        action = "close conn";
+        endpoint->activeClients = (int) mprGetHashLength(endpoint->clientLoad);
         dir = HTTP_TRACE_TX;
         break;
     
     case HTTP_VALIDATE_OPEN_REQUEST:
         assure(conn->rx);
-        if (endpoint->requestCount >= limits->requestMax) {
+        if (endpoint->activeRequests >= limits->requestMax) {
             unlock(endpoint);
             httpError(conn, HTTP_CODE_SERVICE_UNAVAILABLE, "Server overloaded");
-            mprLog(2, "Too many concurrent requests %d/%d", endpoint->requestCount, limits->requestMax);
+            mprLog(2, "Too many concurrent requests %d/%d", endpoint->activeRequests, limits->requestMax);
             return 0;
         }
-        endpoint->requestCount++;
+        endpoint->activeRequests++;
         conn->rx->flags |= HTTP_LIMITS_OPENED;
-        action = "open request";
         dir = HTTP_TRACE_RX;
         break;
 
     case HTTP_VALIDATE_CLOSE_REQUEST:
         if (conn->rx && conn->rx->flags & HTTP_LIMITS_OPENED) {
             /* Requests incremented only when conn->rx is assigned */
-            endpoint->requestCount--;
-            assure(endpoint->requestCount >= 0);
-            action = "close request";
+            endpoint->activeRequests--;
+            assure(endpoint->activeRequests >= 0);
             dir = HTTP_TRACE_TX;
             conn->rx->flags &= ~HTTP_LIMITS_OPENED;
         }
         break;
 
     case HTTP_VALIDATE_OPEN_PROCESS:
-        http->processCount++;
-        if (http->processCount > limits->processMax) {
+        http->activeProcesses++;
+        if (http->activeProcesses > limits->processMax) {
             unlock(endpoint);
             httpError(conn, HTTP_CODE_SERVICE_UNAVAILABLE, "Server overloaded");
-            mprLog(2, "Too many concurrent processes %d/%d", http->processCount, limits->processMax);
+            mprLog(2, "Too many concurrent processes %d/%d", http->activeProcesses, limits->processMax);
             return 0;
         }
-        action = "start process";
         dir = HTTP_TRACE_RX;
         break;
 
     case HTTP_VALIDATE_CLOSE_PROCESS:
-        http->processCount--;
-        assure(http->processCount >= 0);
+        http->activeProcesses--;
+        assure(http->activeProcesses >= 0);
         break;
     }
     if (event == HTTP_VALIDATE_CLOSE_CONN || event == HTTP_VALIDATE_CLOSE_REQUEST) {
         if ((level = httpShouldTrace(conn, dir, HTTP_TRACE_LIMITS, NULL)) >= 0) {
-            LOG(4, "Validate request for %s. Active connections %d, active requests: %d/%d, active client IP %d/%d", 
-                action, mprGetListLength(http->connections), endpoint->requestCount, limits->requestMax, 
-                endpoint->clientCount, limits->clientMax);
+            LOG(4, "Validate request for %d. Active connections %d, active requests: %d/%d, active client IP %d/%d", 
+                event, mprGetListLength(http->connections), endpoint->activeRequests, limits->requestMax, 
+                endpoint->activeClients, limits->clientMax);
         }
     }
 #if KEEP
     LOG(0, "Validate Active connections %d, requests: %d/%d, IP %d/%d, Processes %d/%d", 
-        mprGetListLength(http->connections), endpoint->requestCount, limits->requestMax, 
-        endpoint->clientCount, limits->clientMax, http->processCount, limits->processMax);
+        mprGetListLength(http->connections), endpoint->activeRequests, limits->requestMax, 
+        endpoint->activeClients, limits->clientMax, http->activeProcesses, limits->processMax);
 #endif
     unlock(endpoint);
     return 1;
@@ -441,6 +442,7 @@ PUBLIC void httpMatchHost(HttpConn *conn)
     }
     if (conn->rx->traceLevel >= 0) {
         mprLog(conn->rx->traceLevel, "Use endpoint: %s:%d", endpoint->ip, endpoint->port);
+        mprLog(conn->rx->traceLevel, "Use host %s", host->name);
     }
     conn->host = host;
 }

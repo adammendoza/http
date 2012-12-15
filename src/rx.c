@@ -131,7 +131,7 @@ PUBLIC bool httpPumpRequest(HttpConn *conn, HttpPacket *packet)
     conn->pumping = 1;
 
     while (canProceed) {
-        LOG(7, "httpProcess %s, state %d, error %d", conn->dispatcher->name, conn->state, conn->error);
+        LOG(6, "httpPumpRequest %s, state %d, error %d", conn->dispatcher->name, conn->state, conn->error);
         switch (conn->state) {
         case HTTP_STATE_BEGIN:
         case HTTP_STATE_CONNECTED:
@@ -187,7 +187,7 @@ static bool parseIncoming(HttpConn *conn, HttpPacket *packet)
         return 0;
     }
     if (mprShouldDenyNewRequests()) {
-        httpError(conn, HTTP_ABORT | HTTP_CODE_NOT_ACCEPTABLE, "Server terminating");
+        httpError(conn, HTTP_ABORT | HTTP_CODE_NOT_ACCEPTABLE, "The server is terminating");
         return 0;
     }
     if (!conn->rx) {
@@ -427,6 +427,7 @@ static bool parseRequestLine(HttpConn *conn, HttpPacket *packet)
         return 0;
     }
     rx->originalUri = rx->uri = sclone(uri);
+    conn->http->totalRequests++;
     httpSetState(conn, HTTP_STATE_FIRST);
     return 1;
 }
@@ -562,10 +563,6 @@ static bool parseHeaders(HttpConn *conn, HttpPacket *packet)
                 } else if (scaselesscmp(value, "CLOSE") == 0) {
                     /*  Not really required, but set to 0 to be sure */
                     conn->keepAliveCount = 0;
-#if UNUSED && CLASHES
-                } else if (scaselesscmp(value, "upgrade") == 0) {
-                    rx->upgrade = sclone(value);
-#endif
                 }
 
             } else if (strcasecmp(key, "content-length") == 0) {
@@ -758,33 +755,7 @@ static bool parseHeaders(HttpConn *conn, HttpPacket *packet)
             } else if (strcasecmp(key, "referer") == 0) {
                 /* NOTE: yes the header is misspelt in the spec */
                 rx->referrer = sclone(value);
-#if UNUSED
-            /*
-                There is a draft spec for these, but it has bad DOS security implications.
-             */
-            } else if (strcasecmp(key, "request-timeout") == 0) {
-                conn->limits->requestTimeout = stoi(value) * MPR_TICKS_PER_SEC;
-                conn->limits->inactivityTimeout = stoi(value) * MPR_TICKS_PER_SEC;
-#endif
             }
-            break;
-
-        case 's':
-#if UNUSED
-            if (strcasecmp(key, "sec-websocket-key") == 0) {
-                rx->webSockKey = sclone(value);
-            } else if (strcasecmp(key, "sec-websocket-extensions") == 0) {
-                if (rx->extensions) {
-                    rx->extensions = sjoin(rx->extensions, ", ", value, NULL);
-                } else {
-                    rx->extensions = sclone(value);
-                }
-            } else if (strcasecmp(key, "sec-websocket-protocol") == 0) {
-                rx->webSockProtocols = sclone(value);
-            } else if (strcasecmp(key, "sec-websocket-version") == 0) {
-                rx->webSockVersion = (int) stoi(value);
-            }
-#endif
             break;
 
         case 't':
@@ -885,10 +856,6 @@ static bool processParsed(HttpConn *conn)
         routeRequest(conn);
     }
     /*
-        Don't stream input if a form or upload. NOTE: Upload needs the Files[] collection.
-     */
-    rx->streamInput = !(rx->form || rx->upload);
-    /*
         Send a 100 (Continue) response if the client has requested it. If the connection has an error, that takes
         precedence and 100 Continue will not be sent. Also, if the connector has already written bytes to the socket, we
         do not send 100 Continue to avoid corrupting the response.
@@ -898,18 +865,20 @@ static bool processParsed(HttpConn *conn)
         rx->flags &= ~HTTP_EXPECT_CONTINUE;
     }
     if (!conn->endpoint && conn->upgraded && !httpVerifyWebSocketsHandshake(conn)) {
+        httpSetState(conn, HTTP_STATE_FINALIZED);
         return 1;
     }
     httpSetState(conn, HTTP_STATE_CONTENT);
 
-    if (rx->streamInput) {
-        httpStartPipeline(conn);
-    } else if (rx->remainingContent == 0) {
-        httpPutPacketToNext(conn->readq, httpCreateEndPacket());
+    if (rx->remainingContent == 0) {
         rx->eof = 1;
+    }
+    if (conn->endpoint && !(rx->form || rx->upload)) {
+        httpStartPipeline(conn);
+    }
+    if (rx->eof) {
         httpSetState(conn, HTTP_STATE_READY);
     }
-    httpServiceQueues(conn);
     return 1;
 }
 
@@ -1012,13 +981,15 @@ static bool processContent(HttpConn *conn, HttpPacket *packet)
             Send "end" pack to signify eof to the handler
          */
         httpPutPacketToNext(q, httpCreateEndPacket());
-        if (!rx->streamInput) {
+        if (!tx->started) {
             httpStartPipeline(conn);
         }
         httpSetState(conn, HTTP_STATE_READY);
         return conn->workerEvent ? 0 : 1;
     }
-    httpServiceQueues(conn);
+    if (tx->started) {
+        httpServiceQueues(conn);
+    }
     if (rx->chunkState && nbytes <= 0) {
         /* Insufficient data */
         return 0;
@@ -1149,14 +1120,84 @@ static void measure(HttpConn *conn)
 #endif
 
 
+static void createErrorRequest(HttpConn *conn)
+{
+    HttpRx      *rx;
+    HttpTx      *tx;
+    HttpPacket  *packet;
+    MprBuf      *buf;
+    char        *cp, *headers;
+    int         key;
+
+    rx = conn->rx;
+    tx = conn->tx;
+    if (!rx->headerPacket) {
+        return;
+    }
+    conn->rx = httpCreateRx(conn);
+    conn->tx = httpCreateTx(conn, NULL);
+
+    /* Preserve the old status */
+    conn->tx->status = tx->status;
+    conn->error = 0;
+    conn->errorMsg = 0;
+    conn->upgraded = 0;
+    conn->worker = 0;
+
+    packet = httpCreateDataPacket(HTTP_BUFSIZE);
+    mprPutFmtToBuf(packet->content, "%s %s %s\r\n", rx->method, tx->errorDocument, conn->protocol);
+    buf = rx->headerPacket->content;
+    /*
+        Sever the old Rx and Tx for GC
+     */
+    rx->conn = 0;
+    tx->conn = 0;
+
+    /*
+        Reconstruct the headers. Change nulls to '\r', ' ', or ':' as appropriate
+     */
+    key = 0;
+    headers = 0;
+    for (cp = buf->data; cp < &buf->end[-1]; cp++) {
+        if (*cp == '\0') {
+            if (cp[1] == '\n') {
+                if (!headers) {
+                    headers = &cp[2];
+                }
+                *cp = '\r';
+                key = 0;
+            } else if (!key) {
+                *cp = ':';
+                key = 1;
+            } else {
+                *cp = ' ';
+            }
+        }
+    }
+    if (headers && headers < buf->end) {
+        mprPutStringToBuf(packet->content, headers);
+        conn->input = packet;
+        conn->state = HTTP_STATE_CONNECTED;
+    } else {
+        httpError(conn, HTTP_ABORT | HTTP_CODE_BAD_REQUEST, "Can't reconstruct headers");
+    }
+}
+
+
 static void processCompletion(HttpConn *conn)
 {
     HttpRx      *rx;
+    HttpTx      *tx;
 
-    assure(conn->tx->finalized);
-    assure(conn->tx->finalizedOutput);
-    assure(conn->tx->finalizedConnector);
     rx = conn->rx;
+    tx = conn->tx;
+    assure(tx->finalized);
+    assure(tx->finalizedOutput);
+
+#if BIT_TRACE_MEM
+    mprLog(1, "Request complete, status %d, error %d, connError %d, %s%s, memsize %.2f MB",
+        tx->status, conn->error, conn->connError, rx->hostHeader, rx->uri, mprGetMem() / 1024 / 1024.0);
+#endif
     httpDestroyPipeline(conn);
     measure(conn);
     if (conn->endpoint && rx) {
@@ -1168,6 +1209,10 @@ static void processCompletion(HttpConn *conn)
     }
     assure(conn->state == HTTP_STATE_FINALIZED);
     httpSetState(conn, HTTP_STATE_COMPLETE);
+    if (tx->errorDocument && !conn->connError && !smatch(tx->errorDocument, rx->uri)) {
+        mprLog(2, "  ErrorDoc %s for %d from %s", tx->errorDocument, tx->status, rx->uri);
+        createErrorRequest(conn);
+    }
 }
 
 
@@ -1473,7 +1518,7 @@ static void addMatchEtag(HttpConn *conn, char *etag)
     if (rx->etags == 0) {
         rx->etags = mprCreateList(-1, 0);
     }
-    mprAddItem(rx->etags, etag);
+    mprAddItem(rx->etags, sclone(etag));
 }
 
 

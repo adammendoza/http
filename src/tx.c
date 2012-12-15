@@ -68,6 +68,7 @@ static void manageTx(HttpTx *tx, int flags)
         mprMark(tx->currentRange);
         mprMark(tx->ext);
         mprMark(tx->etag);
+        mprMark(tx->errorDocument);
         mprMark(tx->file);
         mprMark(tx->filename);
         mprMark(tx->handler);
@@ -435,7 +436,13 @@ PUBLIC void httpRedirect(HttpConn *conn, int status, cchar *targetUri)
         }
         target = httpCreateUri(targetUri, 0);
         base = rx->parsedUri;
-        if (!target->port && target->scheme && !smatch(target->scheme, base->scheme)) {
+        /*
+            Support URIs without a host:  https:///path. This is used to redirect onto the same host but with a 
+            different scheme. So find a suitable local endpoint to supply the port for the scheme.
+        */
+        if (!target->port &&
+                (!target->host || smatch(base->host, target->host)) &&
+                (target->scheme && !smatch(target->scheme, base->scheme))) {
             endpoint = smatch(target->scheme, "https") ? conn->host->secureEndpoint : conn->host->defaultEndpoint;
             if (endpoint) {
                 target->port = endpoint->port;

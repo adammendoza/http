@@ -182,30 +182,45 @@ PUBLIC void httpConnTimeout(HttpConn *conn)
     if (conn->timeoutCallback) {
         (conn->timeoutCallback)(conn);
     }
-    if (conn->state >= HTTP_STATE_PARSED && !conn->connError) {
-        if ((conn->lastActivity + limits->inactivityTimeout) < now) {
-            httpError(conn, HTTP_CODE_REQUEST_TIMEOUT,
-                "Exceeded inactivity timeout of %Ld sec", limits->inactivityTimeout / 1000);
+    if (!conn->connError) {
+        if (HTTP_STATE_BEGIN < conn->state && conn->state < HTTP_STATE_PARSED && 
+                (conn->started + limits->requestParseTimeout) < now) {
+            httpError(conn, HTTP_CODE_REQUEST_TIMEOUT, "Exceeded parse headers timeout of %Ld sec", 
+                limits->requestParseTimeout  / 1000);
+            if (conn->rx) {
+                LOG(2, "  State %d, uri %s", conn->state, conn->rx->uri);
+            }
+        } else {
+            if ((conn->lastActivity + limits->inactivityTimeout) < now) {
+                if (conn->state > HTTP_STATE_BEGIN) {
+                    httpError(conn, HTTP_CODE_REQUEST_TIMEOUT,
+                        "Exceeded inactivity timeout of %Ld sec", limits->inactivityTimeout / 1000);
+                    if (conn->rx) {
+                        LOG(2, "  State %d, uri %s", conn->state, conn->rx->uri);
+                    }
+                }
 
-        } else if ((conn->started + limits->requestTimeout) < now) {
-            httpError(conn, HTTP_CODE_REQUEST_TIMEOUT, "Exceeded timeout %d sec", limits->requestTimeout / 1000);
+            } else if ((conn->started + limits->requestTimeout) < now) {
+                httpError(conn, HTTP_CODE_REQUEST_TIMEOUT, "Exceeded timeout %d sec", limits->requestTimeout / 1000);
+                if (conn->rx) {
+                    LOG(2, "  State %d, uri %s", conn->state, conn->rx->uri);
+                }
+            }
         }
     }
-    httpDestroyConn(conn);
+    if (conn->endpoint) {
+        httpDestroyConn(conn);
+    } else {
+        httpDisconnect(conn);
+    }
 }
 
 
 static void commonPrep(HttpConn *conn)
 {
-    Http    *http;
-
-    http = conn->http;
-#if !BIT_LOCK_FIX
-    lock(http);
-#endif
-
     if (conn->timeoutEvent) {
         mprRemoveEvent(conn->timeoutEvent);
+        conn->timeoutEvent = 0;
     }
     conn->lastActivity = conn->http->now;
     conn->error = 0;
@@ -223,9 +238,6 @@ static void commonPrep(HttpConn *conn)
     }
     httpSetState(conn, HTTP_STATE_BEGIN);
     httpInitSchedulerQueue(conn->serviceq);
-#if !BIT_LOCK_FIX
-    unlock(http);
-#endif
 }
 
 
@@ -281,6 +293,7 @@ PUBLIC void httpPrepClientConn(HttpConn *conn, bool keepHeaders)
     MprHash     *headers;
 
     assure(conn);
+    conn->connError = 0;
     if (conn->keepAliveCount >= 0 && conn->sock) {
         /* Eat remaining input incase last request did not consume all data */
         httpConsumeLastRequest(conn);
@@ -349,45 +362,37 @@ PUBLIC void httpEvent(HttpConn *conn, MprEvent *event)
         readEvent(conn);
     }
     httpPostEvent(conn);
-#if !BIT_LOCK_FIX
-    mprYield(0);
-#endif
 }
 
 
 static void readEvent(HttpConn *conn)
 {
     HttpPacket  *packet;
-    HttpQueue   *q;
     ssize       nbytes, size;
 
-    do {
-        if ((packet = getPacket(conn, &size)) == 0) {
+    if ((packet = getPacket(conn, &size)) == 0) {
+        return;
+    }
+    assure(conn->input == packet);
+
+    nbytes = mprReadSocket(conn->sock, mprGetBufEnd(packet->content), size);
+    LOG(7, "http: read event. Got %d", nbytes);
+
+    if (nbytes > 0) {
+        mprAdjustBufEnd(packet->content, nbytes);
+    } else if (nbytes == 0) {
+        return;
+    } else if (nbytes < 0 && mprIsSocketEof(conn->sock)) {
+        conn->keepAliveCount = -1;
+        if (conn->state < HTTP_STATE_PARSED || conn->state == HTTP_STATE_COMPLETE) {
             return;
         }
-        assure(conn->input == packet);
-
-        nbytes = mprReadSocket(conn->sock, mprGetBufEnd(packet->content), size);
-        LOG(7, "http: read event. Got %d", nbytes);
-
-        if (nbytes > 0) {
-            mprAdjustBufEnd(packet->content, nbytes);
-        } else if (nbytes == 0) {
+    }
+    do {
+        if (!httpPumpRequest(conn, conn->input)) {
             break;
-        } else if (nbytes < 0 && mprIsSocketEof(conn->sock)) {
-            conn->keepAliveCount = -1;
-            if (conn->state < HTTP_STATE_PARSED) {
-                break;
-            }
         }
-        do {
-            if (!httpPumpRequest(conn, conn->input)) {
-                break;
-            }
-        } while (conn->endpoint && prepForNext(conn));
-
-        q = conn->readq;
-    } while (nbytes > 0 && !mprGetSocketBlockingMode(conn->sock) && (!q || q->count < q->max));
+    } while (conn->endpoint && prepForNext(conn));
 }
 
 
@@ -477,9 +482,6 @@ PUBLIC void httpEnableConnEvents(HttpConn *conn)
         mprQueueEvent(conn->dispatcher, event);
 
     } else {
-#if !BIT_LOCK_FIX
-        lock(conn->http);
-#endif
         if (tx) {
             /*
                 Can be blocked with data in the iovec and none in the queue
@@ -499,9 +501,6 @@ PUBLIC void httpEnableConnEvents(HttpConn *conn)
             eventMask |= MPR_READABLE;
         }
         httpSetupWaitHandler(conn, eventMask);
-#if !BIT_LOCK_FIX
-        unlock(conn->http);
-#endif
     }
     if (tx && tx->handler && tx->handler->module) {
         tx->handler->module->lastActivity = conn->lastActivity;
@@ -731,6 +730,7 @@ PUBLIC void httpNotify(HttpConn *conn, int event, int arg)
         (conn->notifier)(conn, event, arg);
     }
 }
+
 
 /*
     Set each timeout arg to -1 to skip. Set to zero for no timeout. Otherwise set to number of msecs

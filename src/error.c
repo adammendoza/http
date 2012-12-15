@@ -83,13 +83,26 @@ static void errorv(HttpConn *conn, int flags, cchar *fmt, va_list args)
         if (conn->endpoint && tx && rx) {
             if (tx->flags & HTTP_TX_HEADERS_CREATED) {
                 /* 
-                    If the response headers have been sent, must let the other side of the failure. 
-                    Abort abort is the only way. Disconnect will cause a readable (EOF) event.
+                    If the response headers have been sent, must let the other side of the failure ... aborting
+                    the request is the only way as the status has been sent.
                  */
                 flags |= HTTP_ABORT;
             } else {
                 if (rx->route && (uri = httpLookupRouteErrorDocument(rx->route, tx->status))) {
-                    httpRedirect(conn, HTTP_CODE_MOVED_PERMANENTLY, uri);
+                    /*
+                        If the response has started or it is an external redirect ... do a redirect
+                     */
+                    if (sstarts(uri, "http") || tx->flags & HTTP_TX_HEADERS_CREATED) {
+                        httpRedirect(conn, HTTP_CODE_MOVED_PERMANENTLY, uri);
+                    } else {
+                        /*
+                            No response started and it is an internal redirect, so we can rerun the request.
+                            Set finalized to "cap" any output. processCompletion() in rx.c will rerun the request using
+                            the errorDocument.
+                         */
+                        tx->errorDocument = uri;
+                        tx->finalized = tx->finalizedOutput = tx->finalizedConnector = 1;
+                    }
                 } else {
                     httpAddHeaderString(conn, "Cache-Control", "no-cache");
                     statusMsg = httpLookupStatus(conn->http, status);
@@ -136,8 +149,7 @@ static char *formatErrorv(HttpConn *conn, int status, cchar *fmt, va_list args)
         if (conn->rx == 0 || conn->rx->uri == 0) {
             mprLog(2, "\"%s\", status %d: %s.", httpLookupStatus(conn->http, status), status, conn->errorMsg);
         } else {
-            mprLog(2, "Error: \"%s\", status %d for URI \"%s\": %s.",
-                httpLookupStatus(conn->http, status), status, conn->rx->uri ? conn->rx->uri : "", conn->errorMsg);
+            mprLog(2, "Error: %s", conn->errorMsg);
         }
     }
     return conn->errorMsg;

@@ -71,6 +71,13 @@ PUBLIC void httpCreateTxPipeline(HttpConn *conn, HttpRoute *route)
         q = httpCreateQueue(conn, stage, HTTP_QUEUE_TX, q);
     }
     conn->connectorq = tx->queue[HTTP_QUEUE_TX]->prevQ;
+
+    /*
+        Double the connector max hi-water mark. This optimization permits connectors to accept packets without 
+        unnecesary flow control.
+     */
+    conn->connectorq->max *= 2;
+
     pairQueues(conn);
 
     /*
@@ -80,6 +87,11 @@ PUBLIC void httpCreateTxPipeline(HttpConn *conn, HttpRoute *route)
     httpPutForService(conn->writeq, httpCreateHeaderPacket(), HTTP_DELAY_SERVICE);
     openQueues(conn);
 
+#if FUTURE
+    if (rx->upgrade && !conn->upgraded) {
+        httpError(conn, HTTP_ABORT | HTTP_CODE_BAD_REQUEST, "Cannot upgrade communications protocol");
+    }
+#endif
     if (tx->pendingFinalize) {
         tx->finalizedOutput = 0;
         httpFinalizeOutput(conn);

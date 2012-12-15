@@ -52,7 +52,7 @@ static HttpConn *openConnection(HttpConn *conn, struct MprSsl *ssl)
         httpError(conn, HTTP_CODE_COMMS_ERROR, "Cannot create socket for %s", uri->uri);
         return 0;
     }
-    if ((rc = mprConnectSocket(sp, ip, port, 0)) < 0) {
+    if ((rc = mprConnectSocket(sp, ip, port, MPR_SOCKET_NODELAY)) < 0) {
         httpError(conn, HTTP_CODE_COMMS_ERROR, "Cannot open socket on %s:%d", ip, port);
         return 0;
     }
@@ -136,7 +136,7 @@ PUBLIC int httpConnect(HttpConn *conn, cchar *method, cchar *uri, struct MprSsl 
     httpSetState(conn, HTTP_STATE_CONNECTED);
     conn->authRequested = 0;
     conn->tx->method = supper(method);
-    conn->tx->parsedUri = httpCreateUri(uri, 0);
+    conn->tx->parsedUri = httpCreateUri(uri, HTTP_COMPLETE_URI_PATH);
 #if BIT_DEBUG
     conn->startMark = mprGetHiResTime();
 #endif

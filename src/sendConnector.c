@@ -18,7 +18,7 @@
 static void addPacketForSend(HttpQueue *q, HttpPacket *packet);
 static void adjustSendVec(HttpQueue *q, MprOff written);
 static MprOff buildSendVec(HttpQueue *q);
-static void adjustPacketData(HttpQueue *q, MprOff written);
+static void freeSendPackets(HttpQueue *q, MprOff written);
 static void sendClose(HttpQueue *q);
 
 /*********************************** Code *************************************/
@@ -109,53 +109,39 @@ PUBLIC void httpSendOutgoingService(HttpQueue *q)
             return;
         }
     }
-    /*
-        Loop doing non-blocking I/O until blocked or all the packets received are written.
-     */
-    while (1) {
-        /*
-            Rebuild the iovector only when the past vector has been completely written. Simplifies the logic quite a bit.
-         */
-        if (q->ioIndex == 0 && buildSendVec(q) <= 0) {
-            break;
-        }
-        file = q->ioFile ? tx->file : 0;
-        written = mprSendFileToSocket(conn->sock, file, q->ioPos, q->ioCount, q->iovec, q->ioIndex, NULL, 0);
-
-        mprLog(8, "Send connector ioCount %d, wrote %Ld, written so far %Ld, sending file %d, q->count %d/%d", 
-                q->ioCount, written, tx->bytesWritten, q->ioFile, q->count, q->max);
-        if (written < 0) {
-            errCode = mprGetError(q);
-            if (errCode == EAGAIN || errCode == EWOULDBLOCK) {
-                /* Socket is full. Wait for an I/O event */
-                httpSocketBlocked(conn);
-                break;
-            }
-            if (errCode != EPIPE && errCode != ECONNRESET) {
-                mprLog(7, "SendFileToSocket failed, errCode %d", errCode);
-            }
-            httpError(conn, HTTP_ABORT | HTTP_CODE_COMMS_ERROR, "SendFileToSocket failed, errCode %d", errCode);
-            httpFinalizeConnector(conn);
-            break;
-
-        } else if (written == 0) {
-            /* Socket is full. Wait for an I/O event */
-            httpSocketBlocked(conn);
-            break;
-
-        } else if (written > 0) {
-            tx->bytesWritten += written;
-            adjustPacketData(q, written);
-            adjustSendVec(q, written);
-        }
+    if (q->ioIndex == 0) {
+        buildSendVec(q);
     }
-    if (q->ioCount == 0) {
-        if ((q->flags & HTTP_QUEUE_EOF)) {
-            assure(conn->tx->finalizedOutput);
-            httpFinalizeConnector(conn);
+    /*
+        No need to loop around as send file tries to write as much of the file as possible. 
+        If not eof, will always have the socket blocked.
+     */
+    file = q->ioFile ? tx->file : 0;
+    written = mprSendFileToSocket(conn->sock, file, q->ioPos, q->ioCount, q->iovec, q->ioIndex, NULL, 0);
+    if (written < 0) {
+        errCode = mprGetError();
+        if (errCode == EAGAIN || errCode == EWOULDBLOCK) {
+            /*  Socket full, wait for an I/O event */
+            httpSocketBlocked(conn);
         } else {
-            HTTP_NOTIFY(conn, HTTP_EVENT_WRITABLE, 0);
+            if (errCode != EPIPE && errCode != ECONNRESET && errCode != ENOTCONN) {
+                httpError(conn, HTTP_ABORT | HTTP_CODE_COMMS_ERROR, "sendConnector: error, errCode %d", errCode);
+            } else {
+                httpDisconnect(conn);
+            }
+            httpFinalizeConnector(conn);
         }
+    } else if (written > 0) {
+        tx->bytesWritten += written;
+        freeSendPackets(q, written);
+        adjustSendVec(q, written);
+    }
+    LOG(6, "sendConnector: wrote %d, qflags %x", (int) written, q->flags);
+    if (q->first && q->first->flags & HTTP_PACKET_END) {
+        LOG(6, "sendConnector: end of stream. Finalize connector");
+        httpFinalizeConnector(conn);
+    } else {
+        HTTP_NOTIFY(conn, HTTP_EVENT_WRITABLE, 0);
     }
 }
 
@@ -167,7 +153,7 @@ PUBLIC void httpSendOutgoingService(HttpQueue *q)
  */
 static MprOff buildSendVec(HttpQueue *q)
 {
-    HttpPacket  *packet;
+    HttpPacket  *packet, *prev;
 
     assure(q->ioIndex == 0);
     q->ioCount = 0;
@@ -179,20 +165,22 @@ static MprOff buildSendVec(HttpQueue *q)
         vector entries. Leave the packets on the queue for now, they are removed after the IO is complete for the 
         entire packet.
      */
-    for (packet = q->first; packet; packet = packet->next) {
+    for (packet = prev = q->first; packet && !(packet->flags & HTTP_PACKET_END); packet = packet->next) {
         if (packet->flags & HTTP_PACKET_HEADER) {
             httpWriteHeaders(q, packet);
-            
-        } else if (httpGetPacketLength(packet) == 0 && packet->esize == 0) {
-            q->flags |= HTTP_QUEUE_EOF;
-            if (packet->prefix == NULL) {
-                break;
-            }
         }
         if (q->ioFile || q->ioIndex >= (HTTP_MAX_IOVEC - 2)) {
+            /* Only one file entry allowed */
             break;
         }
-        addPacketForSend(q, packet);
+        if (packet->prefix || packet->esize || httpGetPacketLength(packet) > 0) {
+            addPacketForSend(q, packet);
+        } else {
+            /* Remove empty packets */
+            prev->next = packet->next;
+            continue;
+        }
+        prev = packet;
     }
     return q->ioCount;
 }
@@ -249,12 +237,7 @@ static void addPacketForSend(HttpQueue *q, HttpPacket *packet)
 }
 
 
-/*  
-    Clear entries from the IO vector that have actually been transmitted. This supports partial writes due to the socket
-    being full. Don't come here if we've seen all the packets and all the data has been completely written. ie. small files
-    don't come here.
- */
-static void adjustPacketData(HttpQueue *q, MprOff bytes)
+static void freeSendPackets(HttpQueue *q, MprOff bytes)
 {
     HttpPacket  *packet;
     ssize       len;
@@ -263,7 +246,13 @@ static void adjustPacketData(HttpQueue *q, MprOff bytes)
     assure(q->count >= 0);
     assure(bytes >= 0);
 
-    while ((packet = q->first) != 0) {
+    /*
+        Loop while data to be accounted for and we have not hit the end of data packet
+        There should be 2-3 packets on the queue. A header packet for the HTTP response headers, an optional
+        data packet with packet->esize set to the size of the file, and an end packet with no content.
+        Must leave this routine with the end packet still on the queue and all bytes accounted for.
+     */
+    while ((packet = q->first) != 0 && !(packet->flags & HTTP_PACKET_END) && bytes > 0) {
         if (packet->prefix) {
             len = mprGetBufLength(packet->prefix);
             len = (ssize) min(len, bytes);
@@ -280,25 +269,31 @@ static void adjustPacketData(HttpQueue *q, MprOff bytes)
             packet->epos += len;
             bytes -= len;
             assure(packet->esize >= 0);
-            assure(bytes == 0);
-            if (packet->esize > 0) {
+#if UNUSED
+            if (packet->esize) {
+                /* Still more file to write, but this was all the socket could absorb */
+                assure(bytes == 0);
                 break;
             }
+#endif
+
         } else if ((len = httpGetPacketLength(packet)) > 0) {
+            /* Header packets come here */
             len = (ssize) min(len, bytes);
             mprAdjustBufStart(packet->content, len);
             bytes -= len;
             q->count -= len;
             assure(q->count >= 0);
         }
-        if (httpGetPacketLength(packet) == 0) {
+        if (packet->esize == 0 && httpGetPacketLength(packet) == 0) {
+            /* Done with this packet - consume it */
+            assure(!(packet->flags & HTTP_PACKET_END));
             httpGetPacket(q);
-        }
-        assure(bytes >= 0);
-        if (bytes == 0 && (q->first == NULL || !(q->first->flags & HTTP_PACKET_END))) {
+        } else {
             break;
         }
     }
+    assure(bytes == 0);
 }
 
 
